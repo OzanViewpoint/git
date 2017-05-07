@@ -29,6 +29,8 @@ static int installed_child_cleanup_handler;
 
 static void cleanup_children(int sig, int in_signal)
 {
+	struct child_to_clean *children_to_wait_for = NULL;
+
 	while (children_to_clean) {
 		struct child_to_clean *p = children_to_clean;
 		children_to_clean = p->next;
@@ -45,6 +47,23 @@ static void cleanup_children(int sig, int in_signal)
 		}
 
 		kill(p->pid, sig);
+
+		if (p->process && p->process->wait_after_clean) {
+			p->next = children_to_wait_for;
+			children_to_wait_for = p;
+		} else {
+			if (!in_signal)
+				free(p);
+		}
+	}
+
+	while (children_to_wait_for) {
+		struct child_to_clean *p = children_to_wait_for;
+		children_to_wait_for = p->next;
+
+		while (waitpid(p->pid, NULL, 0) < 0 && errno == EINTR)
+			; /* spin waiting for process exit or error */
+
 		if (!in_signal)
 			free(p);
 	}
@@ -589,29 +608,6 @@ int run_command_v_opt_cd_env(const char **argv, int opt, const char *dir, const 
 	cmd.clean_on_exit = opt & RUN_CLEAN_ON_EXIT ? 1 : 0;
 	cmd.dir = dir;
 	cmd.env = env;
-
-	if (opt & RUN_HIDE_STDERR_ON_SUCCESS) {
-		struct strbuf buf = STRBUF_INIT;
-		int res;
-
-		cmd.err = -1;
-		if (start_command(&cmd) < 0)
-			return -1;
-
-		if (strbuf_read(&buf, cmd.err, 0) < 0) {
-			close(cmd.err);
-			finish_command(&cmd); /* throw away exit code */
-			return -1;
-		}
-
-		close(cmd.err);
-		res = finish_command(&cmd);
-		if (res)
-			fputs(buf.buf, stderr);
-		strbuf_release(&buf);
-		return res;
-	}
-
 	return run_command(&cmd);
 }
 
@@ -875,8 +871,14 @@ const char *find_hook(const char *name)
 
 	strbuf_reset(&path);
 	strbuf_git_path(&path, "hooks/%s", name);
-	if (access(path.buf, X_OK) < 0)
+	if (access(path.buf, X_OK) < 0) {
+#ifdef STRIP_EXTENSION
+		strbuf_addstr(&path, STRIP_EXTENSION);
+		if (access(path.buf, X_OK) >= 0)
+			return path.buf;
+#endif
 		return NULL;
+	}
 	return path.buf;
 }
 

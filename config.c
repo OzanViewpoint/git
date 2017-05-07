@@ -66,6 +66,8 @@ static struct key_value_info *current_config_kvi;
  */
 static enum config_scope current_parsing_scope;
 
+static int core_compression_seen;
+static int pack_compression_seen;
 static int zlib_compression_seen;
 
 /*
@@ -199,11 +201,105 @@ void git_config_push_parameter(const char *text)
 	strbuf_release(&env);
 }
 
+static inline int iskeychar(int c)
+{
+	return isalnum(c) || c == '-';
+}
+
+/*
+ * Auxiliary function to sanity-check and split the key into the section
+ * identifier and variable name.
+ *
+ * Returns 0 on success, -1 when there is an invalid character in the key and
+ * -2 if there is no section name in the key.
+ *
+ * store_key - pointer to char* which will hold a copy of the key with
+ *             lowercase section and variable name
+ * baselen - pointer to int which will hold the length of the
+ *           section + subsection part, can be NULL
+ */
+static int git_config_parse_key_1(const char *key, char **store_key, int *baselen_, int quiet)
+{
+	int i, dot, baselen;
+	const char *last_dot = strrchr(key, '.');
+
+	/*
+	 * Since "key" actually contains the section name and the real
+	 * key name separated by a dot, we have to know where the dot is.
+	 */
+
+	if (last_dot == NULL || last_dot == key) {
+		if (!quiet)
+			error("key does not contain a section: %s", key);
+		return -CONFIG_NO_SECTION_OR_NAME;
+	}
+
+	if (!last_dot[1]) {
+		if (!quiet)
+			error("key does not contain variable name: %s", key);
+		return -CONFIG_NO_SECTION_OR_NAME;
+	}
+
+	baselen = last_dot - key;
+	if (baselen_)
+		*baselen_ = baselen;
+
+	/*
+	 * Validate the key and while at it, lower case it for matching.
+	 */
+	if (store_key)
+		*store_key = xmallocz(strlen(key));
+
+	dot = 0;
+	for (i = 0; key[i]; i++) {
+		unsigned char c = key[i];
+		if (c == '.')
+			dot = 1;
+		/* Leave the extended basename untouched.. */
+		if (!dot || i > baselen) {
+			if (!iskeychar(c) ||
+			    (i == baselen + 1 && !isalpha(c))) {
+				if (!quiet)
+					error("invalid key: %s", key);
+				goto out_free_ret_1;
+			}
+			c = tolower(c);
+		} else if (c == '\n') {
+			if (!quiet)
+				error("invalid key (newline): %s", key);
+			goto out_free_ret_1;
+		}
+		if (store_key)
+			(*store_key)[i] = c;
+	}
+
+	return 0;
+
+out_free_ret_1:
+	if (store_key) {
+		free(*store_key);
+		*store_key = NULL;
+	}
+	return -CONFIG_INVALID_KEY;
+}
+
+int git_config_parse_key(const char *key, char **store_key, int *baselen)
+{
+	return git_config_parse_key_1(key, store_key, baselen, 0);
+}
+
+int git_config_key_is_valid(const char *key)
+{
+	return !git_config_parse_key_1(key, NULL, NULL, 1);
+}
+
 int git_config_parse_parameter(const char *text,
 			       config_fn_t fn, void *data)
 {
 	const char *value;
+	char *canonical_name;
 	struct strbuf **pair;
+	int ret;
 
 	pair = strbuf_split_str(text, '=', 2);
 	if (!pair[0])
@@ -221,13 +317,15 @@ int git_config_parse_parameter(const char *text,
 		strbuf_list_free(pair);
 		return error("bogus config parameter: %s", text);
 	}
-	strbuf_tolower(pair[0]);
-	if (fn(pair[0]->buf, value, data) < 0) {
-		strbuf_list_free(pair);
-		return -1;
+
+	if (git_config_parse_key(pair[0]->buf, &canonical_name, NULL)) {
+		ret = -1;
+	} else {
+		ret = (fn(canonical_name, value, data) < 0) ? -1 : 0;
+		free(canonical_name);
 	}
 	strbuf_list_free(pair);
-	return 0;
+	return ret;
 }
 
 int git_config_from_parameters(config_fn_t fn, void *data)
@@ -352,11 +450,6 @@ static char *parse_value(void)
 		}
 		strbuf_addch(&cf->value, c);
 	}
-}
-
-static inline int iskeychar(int c)
-{
-	return isalnum(c) || c == '-';
 }
 
 static int get_value(config_fn_t fn, void *data, struct strbuf *name)
@@ -824,7 +917,12 @@ static int git_default_core_config(const char *var, const char *value)
 	}
 
 	if (!strcmp(var, "core.logallrefupdates")) {
-		log_all_ref_updates = git_config_bool(var, value);
+		if (value && !strcasecmp(value, "always"))
+			log_all_ref_updates = LOG_REFS_ALWAYS;
+		else if (git_config_bool(var, value))
+			log_all_ref_updates = LOG_REFS_NORMAL;
+		else
+			log_all_ref_updates = LOG_REFS_NONE;
 		return 0;
 	}
 
@@ -834,10 +932,16 @@ static int git_default_core_config(const char *var, const char *value)
 	}
 
 	if (!strcmp(var, "core.abbrev")) {
-		int abbrev = git_config_int(var, value);
-		if (abbrev < minimum_abbrev || abbrev > 40)
-			return -1;
-		default_abbrev = abbrev;
+		if (!value)
+			return config_error_nonbool(var);
+		if (!strcasecmp(value, "auto"))
+			default_abbrev = -1;
+		else {
+			int abbrev = git_config_int(var, value);
+			if (abbrev < minimum_abbrev || abbrev > 40)
+				return error("abbrev length out of range: %d", abbrev);
+			default_abbrev = abbrev;
+		}
 		return 0;
 	}
 
@@ -865,6 +969,8 @@ static int git_default_core_config(const char *var, const char *value)
 		core_compression_seen = 1;
 		if (!zlib_compression_seen)
 			zlib_compression_level = level;
+		if (!pack_compression_seen)
+			pack_compression_level = level;
 		return 0;
 	}
 
@@ -1117,6 +1223,18 @@ int git_default_config(const char *var, const char *value, void *dummy)
 		pack_size_limit_cfg = git_config_ulong(var, value);
 		return 0;
 	}
+
+	if (!strcmp(var, "pack.compression")) {
+		int level = git_config_int(var, value);
+		if (level == -1)
+			level = Z_DEFAULT_COMPRESSION;
+		else if (level < 0 || level > Z_BEST_COMPRESSION)
+			die(_("bad pack compression level %d"), level);
+		pack_compression_level = level;
+		pack_compression_seen = 1;
+		return 0;
+	}
+
 	/* Add other config variables here and to Documentation/config.txt. */
 	return 0;
 }
@@ -1206,10 +1324,10 @@ int git_config_from_mem(config_fn_t fn, const enum config_origin_type origin_typ
 	return do_config_from(&top, fn, data);
 }
 
-static int git_config_from_blob_sha1(config_fn_t fn,
-				     const char *name,
-				     const unsigned char *sha1,
-				     void *data)
+int git_config_from_blob_sha1(config_fn_t fn,
+			      const char *name,
+			      const unsigned char *sha1,
+			      void *data)
 {
 	enum object_type type;
 	char *buf;
@@ -1962,107 +2080,6 @@ void git_config_set(const char *key, const char *value)
 }
 
 /*
- * Auxiliary function to sanity-check and split the key into the section
- * identifier and variable name.
- *
- * Returns 0 on success, -1 when there is an invalid character in the key and
- * -2 if there is no section name in the key.
- *
- * store_key - pointer to char* which will hold a copy of the key with
- *             lowercase section and variable name
- * baselen - pointer to int which will hold the length of the
- *           section + subsection part, can be NULL
- */
-static int git_config_parse_key_1(const char *key, char **store_key, int *baselen_, int quiet)
-{
-	int i, dot, baselen;
-	const char *last_dot = strrchr(key, '.');
-
-	/*
-	 * Since "key" actually contains the section name and the real
-	 * key name separated by a dot, we have to know where the dot is.
-	 */
-
-	if (last_dot == NULL || last_dot == key) {
-		if (!quiet)
-			error("key does not contain a section: %s", key);
-		return -CONFIG_NO_SECTION_OR_NAME;
-	}
-
-	if (!last_dot[1]) {
-		if (!quiet)
-			error("key does not contain variable name: %s", key);
-		return -CONFIG_NO_SECTION_OR_NAME;
-	}
-
-	baselen = last_dot - key;
-	if (baselen_)
-		*baselen_ = baselen;
-
-	/*
-	 * Validate the key and while at it, lower case it for matching.
-	 */
-	if (store_key)
-		*store_key = xmallocz(strlen(key));
-
-	dot = 0;
-	for (i = 0; key[i]; i++) {
-		unsigned char c = key[i];
-		if (c == '.')
-			dot = 1;
-		/* Leave the extended basename untouched.. */
-		if (!dot || i > baselen) {
-			if (!iskeychar(c) ||
-			    (i == baselen + 1 && !isalpha(c))) {
-				if (!quiet)
-					error("invalid key: %s", key);
-				goto out_free_ret_1;
-			}
-			c = tolower(c);
-		} else if (c == '\n') {
-			if (!quiet)
-				error("invalid key (newline): %s", key);
-			goto out_free_ret_1;
-		}
-		if (store_key)
-			(*store_key)[i] = c;
-	}
-
-	return 0;
-
-out_free_ret_1:
-	if (store_key) {
-		free(*store_key);
-		*store_key = NULL;
-	}
-	return -CONFIG_INVALID_KEY;
-}
-
-int git_config_parse_key(const char *key, char **store_key, int *baselen)
-{
-	return git_config_parse_key_1(key, store_key, baselen, 0);
-}
-
-int git_config_key_is_valid(const char *key)
-{
-	return !git_config_parse_key_1(key, NULL, NULL, 1);
-}
-
-static int lock_config_file(const char *config_filename,
-		struct lock_file **result)
-{
-	int fd;
-
-	*result = xcalloc(1, sizeof(struct lock_file));
-	fd = hold_lock_file_for_update(*result, config_filename, 0);
-	if (fd < 0)
-		error("could not lock config file %s: %s", config_filename,
-				strerror(errno));
-
-	return fd;
-}
-
-/*
  * If value==NULL, unset in (remove from) config,
  * if value_regex!=NULL, disregard key/value pairs where value does not match.
  * if value_regex==CONFIG_REGEX_NONE, do not match any existing values
@@ -2113,7 +2130,8 @@ int git_config_set_multivar_in_file_gently(const char *config_filename,
 	 * The lock serves a purpose in addition to locking: the new
 	 * contents of .git/config will be written into it.
 	 */
-	fd = lock_config_file(config_filename, &lock);
+	lock = xcalloc(1, sizeof(struct lock_file));
+	fd = hold_lock_file_for_update(lock, config_filename, 0);
 	if (fd < 0) {
 		error_errno("could not lock config file %s", config_filename);
 		free(store.key);
@@ -2206,7 +2224,12 @@ int git_config_set_multivar_in_file_gently(const char *config_filename,
 			goto out_free;
 		}
 
-		fstat(in_fd, &st);
+		if (fstat(in_fd, &st) == -1) {
+			error_errno(_("fstat on %s failed"), config_filename);
+			ret = CONFIG_INVALID_FILE;
+			goto out_free;
+		}
+
 		contents_sz = xsize_t(st.st_size);
 		contents = xmmap_gently(NULL, contents_sz, PROT_READ,
 					MAP_PRIVATE, in_fd, 0);
@@ -2403,27 +2426,33 @@ int git_config_rename_section_in_file(const char *config_filename,
 	struct lock_file *lock;
 	int out_fd;
 	char buf[1024];
-	FILE *config_file;
+	FILE *config_file = NULL;
 	struct stat st;
 
 	if (new_name && !section_name_is_ok(new_name)) {
 		ret = error("invalid section name: %s", new_name);
-		goto out;
+		goto out_no_rollback;
 	}
 
 	if (!config_filename)
 		config_filename = filename_buf = git_pathdup("config");
 
-	out_fd = lock_config_file(config_filename, &lock);
-	if (out_fd < 0)
+	lock = xcalloc(1, sizeof(struct lock_file));
+	out_fd = hold_lock_file_for_update(lock, config_filename, 0);
+	if (out_fd < 0) {
+		ret = error("could not lock config file %s", config_filename);
 		goto out;
+	}
 
 	if (!(config_file = fopen(config_filename, "rb"))) {
 		/* no config file means nothing to rename, no error */
-		goto unlock_and_out;
+		goto commit_and_out;
 	}
 
-	fstat(fileno(config_file), &st);
+	if (fstat(fileno(config_file), &st) == -1) {
+		ret = error_errno(_("fstat on %s failed"), config_filename);
+		goto out;
+	}
 
 	if (chmod(get_lock_file_path(lock), st.st_mode & 07777) < 0) {
 		ret = error_errno("chmod on %s failed",
@@ -2479,11 +2508,16 @@ int git_config_rename_section_in_file(const char *config_filename,
 		}
 	}
 	fclose(config_file);
-unlock_and_out:
+	config_file = NULL;
+commit_and_out:
 	if (commit_lock_file(lock) < 0)
 		ret = error_errno("could not write config file %s",
 				  config_filename);
 out:
+	if (config_file)
+		fclose(config_file);
+	rollback_lock_file(lock);
+out_no_rollback:
 	free(filename_buf);
 	return ret;
 }
@@ -2508,11 +2542,10 @@ int parse_config_key(const char *var,
 		     const char **subsection, int *subsection_len,
 		     const char **key)
 {
-	int section_len = strlen(section);
 	const char *dot;
 
 	/* Does it start with "section." ? */
-	if (!starts_with(var, section) || var[section_len] != '.')
+	if (!skip_prefix(var, section, &var) || *var != '.')
 		return -1;
 
 	/*
@@ -2524,12 +2557,16 @@ int parse_config_key(const char *var,
 	*key = dot + 1;
 
 	/* Did we have a subsection at all? */
-	if (dot == var + section_len) {
-		*subsection = NULL;
-		*subsection_len = 0;
+	if (dot == var) {
+		if (subsection) {
+			*subsection = NULL;
+			*subsection_len = 0;
+		}
 	}
 	else {
-		*subsection = var + section_len + 1;
+		if (!subsection)
+			return -1;
+		*subsection = var + 1;
 		*subsection_len = dot - *subsection;
 	}
 

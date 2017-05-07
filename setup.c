@@ -36,7 +36,7 @@ static int abspath_part_inside_repo(char *path)
 	off = offset_1st_component(path);
 
 	/* check if work tree is already the prefix */
-	if (wtlen <= len && !strncmp(path, work_tree, wtlen)) {
+	if (wtlen <= len && !fspathncmp(path, work_tree, wtlen)) {
 		if (path[wtlen] == '/') {
 			memmove(path, path + wtlen + 1, len - wtlen);
 			return 0;
@@ -56,7 +56,7 @@ static int abspath_part_inside_repo(char *path)
 		path++;
 		if (*path == '/') {
 			*path = '\0';
-			if (strcmp(real_path(path0), work_tree) == 0) {
+			if (fspathcmp(real_path(path0), work_tree) == 0) {
 				memmove(path0, path + 1, len - (path - path0));
 				return 0;
 			}
@@ -65,7 +65,7 @@ static int abspath_part_inside_repo(char *path)
 	}
 
 	/* check whole path */
-	if (strcmp(real_path(path0), work_tree) == 0) {
+	if (fspathcmp(real_path(path0), work_tree) == 0) {
 		*path0 = '\0';
 		return 0;
 	}
@@ -254,10 +254,12 @@ int get_common_dir_noenv(struct strbuf *sb, const char *gitdir)
 		if (!is_absolute_path(data.buf))
 			strbuf_addf(&path, "%s/", gitdir);
 		strbuf_addbuf(&path, &data);
-		strbuf_addstr(sb, real_path(path.buf));
+		strbuf_add_real_path(sb, path.buf);
 		ret = 1;
-	} else
+	} else {
 		strbuf_addstr(sb, gitdir);
+	}
+
 	strbuf_release(&data);
 	strbuf_release(&path);
 	return ret;
@@ -484,6 +486,30 @@ int verify_repository_format(const struct repository_format *format,
 	return 0;
 }
 
+void read_gitfile_error_die(int error_code, const char *path, const char *dir)
+{
+	switch (error_code) {
+	case READ_GITFILE_ERR_STAT_FAILED:
+	case READ_GITFILE_ERR_NOT_A_FILE:
+		/* non-fatal; follow return path */
+		break;
+	case READ_GITFILE_ERR_OPEN_FAILED:
+		die_errno("Error opening '%s'", path);
+	case READ_GITFILE_ERR_TOO_LARGE:
+		die("Too large to be a .git file: '%s'", path);
+	case READ_GITFILE_ERR_READ_FAILED:
+		die("Error reading %s", path);
+	case READ_GITFILE_ERR_INVALID_FORMAT:
+		die("Invalid gitfile format: %s", path);
+	case READ_GITFILE_ERR_NO_PATH:
+		die("No path in gitfile: %s", path);
+	case READ_GITFILE_ERR_NOT_A_REPO:
+		die("Not a git repository: %s", dir);
+	default:
+		die("BUG: unknown error code");
+	}
+}
+
 /*
  * Try to read the location of the git directory from the .git file,
  * return path to git directory if found.
@@ -557,28 +583,8 @@ const char *read_gitfile_gently(const char *path, int *return_error_code)
 cleanup_return:
 	if (return_error_code)
 		*return_error_code = error_code;
-	else if (error_code) {
-		switch (error_code) {
-		case READ_GITFILE_ERR_STAT_FAILED:
-		case READ_GITFILE_ERR_NOT_A_FILE:
-			/* non-fatal; follow return path */
-			break;
-		case READ_GITFILE_ERR_OPEN_FAILED:
-			die_errno("Error opening '%s'", path);
-		case READ_GITFILE_ERR_TOO_LARGE:
-			die("Too large to be a .git file: '%s'", path);
-		case READ_GITFILE_ERR_READ_FAILED:
-			die("Error reading %s", path);
-		case READ_GITFILE_ERR_INVALID_FORMAT:
-			die("Invalid gitfile format: %s", path);
-		case READ_GITFILE_ERR_NO_PATH:
-			die("No path in gitfile: %s", path);
-		case READ_GITFILE_ERR_NOT_A_REPO:
-			die("Not a git repository: %s", dir);
-		default:
-			assert(0);
-		}
-	}
+	else if (error_code)
+		read_gitfile_error_die(error_code, path, dir);
 
 	free(buf);
 	return error_code ? NULL : path;
@@ -691,11 +697,16 @@ static const char *setup_discovered_git_dir(const char *gitdir,
 
 	/* --work-tree is set without --git-dir; use discovered one */
 	if (getenv(GIT_WORK_TREE_ENVIRONMENT) || git_work_tree_cfg) {
+		char *p = NULL;
+		const char *ret;
+
 		if (offset != cwd->len && !is_absolute_path(gitdir))
-			gitdir = xstrdup(real_path(gitdir));
+			gitdir = p = real_pathdup(gitdir, 1);
 		if (chdir(cwd->buf))
 			die_errno("Could not come back to cwd");
-		return setup_explicit_git_dir(gitdir, cwd, nongit_ok);
+		ret = setup_explicit_git_dir(gitdir, cwd, nongit_ok);
+		free(p);
+		return ret;
 	}
 
 	/* #16.2, #17.2, #20.2, #21.2, #24, #25, #28, #29 (see t1510) */
@@ -734,7 +745,7 @@ static const char *setup_bare_git_dir(struct strbuf *cwd, int offset,
 
 	/* --work-tree is set without --git-dir; use discovered one */
 	if (getenv(GIT_WORK_TREE_ENVIRONMENT) || git_work_tree_cfg) {
-		const char *gitdir;
+		static const char *gitdir;
 
 		gitdir = offset == cwd->len ? "." : xmemdupz(cwd->buf, offset);
 		if (chdir(cwd->buf))
@@ -800,11 +811,12 @@ static int canonicalize_ceiling_entry(struct string_list_item *item,
 		/* Keep entry but do not canonicalize it */
 		return 1;
 	} else {
-		const char *real_path = real_path_if_valid(ceil);
-		if (!real_path)
+		char *real_path = real_pathdup(ceil, 0);
+		if (!real_path) {
 			return 0;
+		}
 		free(item->string);
-		item->string = xstrdup(real_path);
+		item->string = real_path;
 		return 1;
 	}
 }
@@ -1014,11 +1026,11 @@ const char *setup_git_directory(void)
 	return setup_git_directory_gently(NULL);
 }
 
-const char *resolve_gitdir(const char *suspect)
+const char *resolve_gitdir_gently(const char *suspect, int *return_error_code)
 {
 	if (is_git_directory(suspect))
 		return suspect;
-	return read_gitfile(suspect);
+	return read_gitfile_gently(suspect, return_error_code);
 }
 
 /* if any standard file descriptor is missing open it to /dev/null */

@@ -475,6 +475,9 @@ int mingw_raise(int sig);
 int winansi_isatty(int fd);
 #define isatty winansi_isatty
 
+int winansi_dup2(int oldfd, int newfd);
+#define dup2 winansi_dup2
+
 void winansi_init(void);
 HANDLE winansi_get_osfhandle(int fd);
 
@@ -486,7 +489,6 @@ HANDLE winansi_get_osfhandle(int fd);
 	(isalpha(*(path)) && (path)[1] == ':' ? 2 : 0)
 int mingw_skip_dos_drive_prefix(char **path);
 #define skip_dos_drive_prefix mingw_skip_dos_drive_prefix
-#define has_unc_prefix(path) (*(path) == '\\' && (path)[1] == '\\' ? 2 : 0)
 #define is_dir_sep(c) ((c) == '/' || (c) == '\\')
 static inline char *mingw_find_last_dir_sep(const char *path)
 {
@@ -702,6 +704,7 @@ extern CRITICAL_SECTION pinfo_cs;
 #if defined(_MSC_VER)
 
 int msc_startup(int argc, wchar_t **w_argv, wchar_t **w_env);
+extern int msc_main(int argc, const char **argv);
 
 #define main(c,v) dummy_decl_msc_main(void);				\
 int wmain(int my_argc,									\

@@ -75,7 +75,7 @@ static int parse_index_info(char *p, int *mode1, int *mode2,
 	*status = *++p;
 	if (!*status)
 		return error("missing status");
-	if (p[1])
+	if (p[1] && !isdigit(p[1]))
 		return error("unexpected trailer: '%s'", p + 1);
 	return 0;
 }
@@ -226,6 +226,7 @@ static void changed_files(struct hashmap *result, const char *index_path,
 		hashmap_entry_init(entry, strhash(buf.buf));
 		hashmap_add(result, entry);
 	}
+	fclose(fp);
 	if (finish_command(&diff_files))
 		die("diff-files did not exit properly");
 	strbuf_release(&index_env);
@@ -254,6 +255,62 @@ static int ensure_leading_directories(char *path)
 	}
 }
 
+/*
+ * Unconditional writing of a plain regular file is what
+ * "git difftool --dir-diff" wants to do for symlinks.  We are preparing two
+ * temporary directories to be fed to a Git-unaware tool that knows how to
+ * show a diff of two directories (e.g. "diff -r A B").
+ *
+ * Because the tool is Git-unaware, if a symbolic link appears in either of
+ * these temporary directories, it will try to dereference and show the
+ * difference of the target of the symbolic link, which is not what we want,
+ * as the goal of the dir-diff mode is to produce an output that is logically
+ * equivalent to what "git diff" produces.
+ *
+ * Most importantly, we want to get textual comparison of the result of the
+ * readlink(2).  get_symlink() provides that---it returns the contents of
+ * the symlink that gets written to a regular file to force the external tool
+ * to compare the readlink(2) result as text, even on a filesystem that is
+ * capable of doing a symbolic link.
+ */
+static char *get_symlink(const struct object_id *oid, const char *path)
+{
+	char *data;
+	if (is_null_oid(oid)) {
+		/* The symlink is unknown to Git so read from the filesystem */
+		struct strbuf link = STRBUF_INIT;
+		if (has_symlinks) {
+			if (strbuf_readlink(&link, path, strlen(path)))
+				die(_("could not read symlink %s"), path);
+		} else if (strbuf_read_file(&link, path, 128))
+			die(_("could not read symlink file %s"), path);
+
+		data = strbuf_detach(&link, NULL);
+	} else {
+		enum object_type type;
+		unsigned long size;
+		data = read_sha1_file(oid->hash, &type, &size);
+		if (!data)
+			die(_("could not read object %s for symlink %s"),
+				oid_to_hex(oid), path);
+	}
+
+	return data;
+}
+
+static int checkout_path(unsigned mode, struct object_id *oid,
+			 const char *path, const struct checkout *state)
+{
+	struct cache_entry *ce;
+	int ret;
+
+	ce = make_cache_entry(mode, oid->hash, path, 0, 0);
+	ret = checkout_entry(ce, state, NULL);
+
+	free(ce);
+	return ret;
+}
+
 static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 			int argc, const char **argv)
 {
@@ -262,16 +319,14 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	struct strbuf rpath = STRBUF_INIT, buf = STRBUF_INIT;
 	struct strbuf ldir = STRBUF_INIT, rdir = STRBUF_INIT;
 	struct strbuf wtdir = STRBUF_INIT;
+	char *lbase_dir, *rbase_dir;
 	size_t ldir_len, rdir_len, wtdir_len;
-	struct cache_entry *ce = xcalloc(1, sizeof(ce) + PATH_MAX + 1);
 	const char *workdir, *tmp;
 	int ret = 0, i;
 	FILE *fp;
 	struct hashmap working_tree_dups, submodules, symlinks2;
 	struct hashmap_iter iter;
 	struct pair_entry *entry;
-	enum object_type type;
-	unsigned long size;
 	struct index_state wtindex;
 	struct checkout lstate, rstate;
 	int rc, flags = RUN_GIT_CMD, err = 0;
@@ -298,11 +353,11 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 	memset(&wtindex, 0, sizeof(wtindex));
 
 	memset(&lstate, 0, sizeof(lstate));
-	lstate.base_dir = ldir.buf;
+	lstate.base_dir = lbase_dir = xstrdup(ldir.buf);
 	lstate.base_dir_len = ldir.len;
 	lstate.force = 1;
 	memset(&rstate, 0, sizeof(rstate));
-	rstate.base_dir = rdir.buf;
+	rstate.base_dir = rbase_dir = xstrdup(rdir.buf);
 	rstate.base_dir_len = rdir.len;
 	rstate.force = 1;
 
@@ -336,7 +391,6 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		struct object_id loid, roid;
 		char status;
 		const char *src_path, *dst_path;
-		size_t src_path_len, dst_path_len;
 
 		if (starts_with(info.buf, "::"))
 			die(N_("combined diff formats('-c' and '--cc') are "
@@ -349,17 +403,14 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		if (strbuf_getline_nul(&lpath, fp))
 			break;
 		src_path = lpath.buf;
-		src_path_len = lpath.len;
 
 		i++;
 		if (status != 'C' && status != 'R') {
 			dst_path = src_path;
-			dst_path_len = src_path_len;
 		} else {
 			if (strbuf_getline_nul(&rpath, fp))
 				break;
 			dst_path = rpath.buf;
-			dst_path_len = rpath.len;
 		}
 
 		if (S_ISGITLINK(lmode) || S_ISGITLINK(rmode)) {
@@ -377,27 +428,23 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		}
 
 		if (S_ISLNK(lmode)) {
-			char *content = read_sha1_file(loid.hash, &type, &size);
+			char *content = get_symlink(&loid, src_path);
 			add_left_or_right(&symlinks2, src_path, content, 0);
 			free(content);
 		}
 
 		if (S_ISLNK(rmode)) {
-			char *content = read_sha1_file(roid.hash, &type, &size);
+			char *content = get_symlink(&roid, dst_path);
 			add_left_or_right(&symlinks2, dst_path, content, 1);
 			free(content);
 		}
 
 		if (lmode && status != 'C') {
-			ce->ce_mode = lmode;
-			oidcpy(&ce->oid, &loid);
-			strcpy(ce->name, src_path);
-			ce->ce_namelen = src_path_len;
-			if (checkout_entry(ce, &lstate, NULL))
+			if (checkout_path(lmode, &loid, src_path, &lstate))
 				return error("could not write '%s'", src_path);
 		}
 
-		if (rmode) {
+		if (rmode && !S_ISLNK(rmode)) {
 			struct working_tree_entry *entry;
 
 			/* Avoid duplicate working_tree entries */
@@ -410,11 +457,7 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 			hashmap_add(&working_tree_dups, entry);
 
 			if (!use_wt_file(workdir, dst_path, &roid)) {
-				ce->ce_mode = rmode;
-				oidcpy(&ce->oid, &roid);
-				strcpy(ce->name, dst_path);
-				ce->ce_namelen = dst_path_len;
-				if (checkout_entry(ce, &rstate, NULL))
+				if (checkout_path(rmode, &roid, dst_path, &rstate))
 					return error("could not write '%s'",
 						     dst_path);
 			} else if (!is_null_oid(&roid)) {
@@ -455,6 +498,7 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		}
 	}
 
+	fclose(fp);
 	if (finish_command(&child)) {
 		ret = error("error occurred running diff --raw");
 		goto finish;
@@ -567,7 +611,7 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 				warning(_("both files modified: '%s' and '%s'."),
 					wtdir.buf, rdir.buf);
 				warning(_("working tree file has been left."));
-				warning("");
+				warning("%s", "");
 				err = 1;
 			} else if (unlink(wtdir.buf) ||
 				   copy_file(wtdir.buf, rdir.buf, st.st_mode))
@@ -584,7 +628,8 @@ static int run_dir_diff(const char *extcmd, int symlinks, const char *prefix,
 		exit_cleanup(tmpdir, rc);
 
 finish:
-	free(ce);
+	free(lbase_dir);
+	free(rbase_dir);
 	strbuf_release(&ldir);
 	strbuf_release(&rdir);
 	strbuf_release(&wtdir);
@@ -614,30 +659,6 @@ static int run_file_diff(int prompt, const char *prefix,
 		argv_array_push(&args, argv[i]);
 	ret = run_command_v_opt_cd_env(args.argv, RUN_GIT_CMD, prefix, env);
 	exit(ret);
-}
-
-/*
- * NEEDSWORK: this function can go once the legacy-difftool Perl script is
- * retired.
- *
- * We intentionally avoid reading the config directly here, to avoid messing up
- * the GIT_* environment variables when we need to fall back to exec()ing the
- * Perl script.
- */
-static int use_builtin_difftool(void) {
-	struct child_process cp = CHILD_PROCESS_INIT;
-	struct strbuf out = STRBUF_INIT;
-	int ret;
-
-	argv_array_pushl(&cp.args,
-			 "config", "--bool", "difftool.usebuiltin", NULL);
-	cp.git_cmd = 1;
-	if (capture_command(&cp, &out, 6))
-		return 0;
-	strbuf_trim(&out);
-	ret = !strcmp("true", out.buf);
-	strbuf_release(&out);
-	return ret;
 }
 
 int cmd_difftool(int argc, const char **argv, const char *prefix)
@@ -671,27 +692,6 @@ int cmd_difftool(int argc, const char **argv, const char *prefix)
 		OPT_END()
 	};
 
-	/*
-	 * NEEDSWORK: Once the builtin difftool has been tested enough
-	 * and git-legacy-difftool.perl is retired to contrib/, this preamble
-	 * can be removed.
-	 */
-	if (!use_builtin_difftool()) {
-		const char *path = mkpath("%s/git-legacy-difftool",
-					  git_exec_path());
-
-		if (sane_execvp(path, (char **)argv) < 0)
-			die_errno("could not exec %s", path);
-
-		return 0;
-	}
-	prefix = setup_git_directory();
-	trace_repo_setup(prefix);
-	setup_work_tree();
-	/* NEEDSWORK: once we no longer spawn anything, remove this */
-	setenv(GIT_DIR_ENVIRONMENT, absolute_path(get_git_dir()), 1);
-	setenv(GIT_WORK_TREE_ENVIRONMENT, absolute_path(get_git_work_tree()), 1);
-
 	git_config(difftool_config, NULL);
 	symlinks = has_symlinks;
 
@@ -701,6 +701,10 @@ int cmd_difftool(int argc, const char **argv, const char *prefix)
 
 	if (tool_help)
 		return print_tool_help();
+
+	/* NEEDSWORK: once we no longer spawn anything, remove this */
+	setenv(GIT_DIR_ENVIRONMENT, absolute_path(get_git_dir()), 1);
+	setenv(GIT_WORK_TREE_ENVIRONMENT, absolute_path(get_git_work_tree()), 1);
 
 	if (use_gui_tool && diff_gui_tool && *diff_gui_tool)
 		setenv("GIT_DIFF_TOOL", diff_gui_tool, 1);

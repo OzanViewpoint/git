@@ -795,8 +795,8 @@ static char *refuse_unconfigured_deny_msg =
 	   "with what you pushed, and will require 'git reset --hard' to match\n"
 	   "the work tree to HEAD.\n"
 	   "\n"
-	   "You can set 'receive.denyCurrentBranch' configuration variable to\n"
-	   "'ignore' or 'warn' in the remote repository to allow pushing into\n"
+	   "You can set the 'receive.denyCurrentBranch' configuration variable\n"
+	   "to 'ignore' or 'warn' in the remote repository to allow pushing into\n"
 	   "its current branch; however, this is not recommended unless you\n"
 	   "arranged to update its work tree to match what you pushed in some\n"
 	   "other way.\n"
@@ -984,7 +984,8 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 {
 	const char *name = cmd->ref_name;
 	struct strbuf namespaced_name_buf = STRBUF_INIT;
-	const char *namespaced_name, *ret;
+	static char *namespaced_name;
+	const char *ret;
 	unsigned char *old_sha1 = cmd->old_sha1;
 	unsigned char *new_sha1 = cmd->new_sha1;
 
@@ -995,6 +996,7 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 	}
 
 	strbuf_addf(&namespaced_name_buf, "%s%s", get_git_namespace(), name);
+	free(namespaced_name);
 	namespaced_name = strbuf_detach(&namespaced_name_buf, NULL);
 
 	if (is_ref_checked_out(namespaced_name)) {
@@ -1125,25 +1127,22 @@ static const char *update(struct command *cmd, struct shallow_info *si)
 static void run_update_post_hook(struct command *commands)
 {
 	struct command *cmd;
-	int argc;
 	struct child_process proc = CHILD_PROCESS_INIT;
 	const char *hook;
 
 	hook = find_hook("post-update");
-	for (argc = 0, cmd = commands; cmd; cmd = cmd->next) {
-		if (cmd->error_string || cmd->did_not_exist)
-			continue;
-		argc++;
-	}
-	if (!argc || !hook)
+	if (!hook)
 		return;
 
-	argv_array_push(&proc.args, hook);
 	for (cmd = commands; cmd; cmd = cmd->next) {
 		if (cmd->error_string || cmd->did_not_exist)
 			continue;
+		if (!proc.args.argc)
+			argv_array_push(&proc.args, hook);
 		argv_array_push(&proc.args, cmd->ref_name);
 	}
+	if (!proc.args.argc)
+		return;
 
 	proc.no_stdin = 1;
 	proc.stdout_to_stderr = 1;
@@ -1664,8 +1663,11 @@ static const char *unpack(int err_fd, struct shallow_info *si)
 	}
 
 	tmp_objdir = tmp_objdir_create();
-	if (!tmp_objdir)
+	if (!tmp_objdir) {
+		if (err_fd > 0)
+			close(err_fd);
 		return "unable to create temporary object directory";
+	}
 	child.env = tmp_objdir_env(tmp_objdir);
 
 	/*
@@ -1942,8 +1944,7 @@ int cmd_receive_pack(int argc, const char **argv, const char *prefix)
 		run_receive_hook(commands, "post-receive", 1,
 				 &push_options);
 		run_update_post_hook(commands);
-		if (push_options.nr)
-			string_list_clear(&push_options, 0);
+		string_list_clear(&push_options, 0);
 		if (auto_gc) {
 			const char *argv_gc_auto[] = {
 				"gc", "--auto", "--quiet", NULL,

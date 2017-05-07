@@ -404,7 +404,7 @@ int refname_match(const char *abbrev_name, const char *full_name)
 static char *substitute_branch_name(const char **string, int *len)
 {
 	struct strbuf buf = STRBUF_INIT;
-	int ret = interpret_branch_name(*string, *len, &buf);
+	int ret = interpret_branch_name(*string, *len, &buf, 0);
 
 	if (ret == *len) {
 		size_t size;
@@ -638,12 +638,17 @@ int copy_reflog_msg(char *buf, const char *msg)
 
 int should_autocreate_reflog(const char *refname)
 {
-	if (!log_all_ref_updates)
+	switch (log_all_ref_updates) {
+	case LOG_REFS_ALWAYS:
+		return 1;
+	case LOG_REFS_NORMAL:
+		return starts_with(refname, "refs/heads/") ||
+			starts_with(refname, "refs/remotes/") ||
+			starts_with(refname, "refs/notes/") ||
+			!strcmp(refname, "HEAD");
+	default:
 		return 0;
-	return starts_with(refname, "refs/heads/") ||
-		starts_with(refname, "refs/remotes/") ||
-		starts_with(refname, "refs/notes/") ||
-		!strcmp(refname, "HEAD");
+	}
 }
 
 int is_branch(const char *refname)
@@ -1029,10 +1034,10 @@ static struct string_list *hide_refs;
 
 int parse_hide_refs_config(const char *var, const char *value, const char *section)
 {
+	const char *key;
 	if (!strcmp("transfer.hiderefs", var) ||
-	    /* NEEDSWORK: use parse_config_key() once both are merged */
-	    (starts_with(var, section) && var[strlen(section)] == '.' &&
-	     !strcmp(var + strlen(section), ".hiderefs"))) {
+	    (!parse_config_key(var, section, NULL, NULL, &key) &&
+	     !strcmp(key, "hiderefs"))) {
 		char *ref;
 		int len;
 

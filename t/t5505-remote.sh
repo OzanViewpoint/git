@@ -153,6 +153,25 @@ test_expect_success 'remove errors out early when deleting non-existent branch' 
 	)
 '
 
+test_expect_success 'remove remote with a branch without configured merge' '
+	test_when_finished "(
+		git -C test checkout master;
+		git -C test branch -D two;
+		git -C test config --remove-section remote.two;
+		git -C test config --remove-section branch.second;
+		true
+	)" &&
+	(
+		cd test &&
+		git remote add two ../two &&
+		git fetch two &&
+		git checkout -b second two/master^0 &&
+		git config branch.second.remote two &&
+		git checkout master &&
+		git remote rm two
+	)
+'
+
 test_expect_success 'rename errors out early when deleting non-existent branch' '
 	(
 		cd test &&
@@ -762,6 +781,13 @@ test_expect_success 'rename a remote with name prefix of other remote' '
 		git remote rename o upstream &&
 		test "$(git rev-parse origin/master)" = "$(git rev-parse master)"
 	)
+'
+
+test_expect_success 'rename succeeds with existing remote.<target>.prune' '
+	git clone one four.four &&
+	test_when_finished git config --global --unset remote.upstream.prune &&
+	git config --global remote.upstream.prune true &&
+	git -C four.four remote rename origin upstream
 '
 
 cat >remotes_origin <<EOF

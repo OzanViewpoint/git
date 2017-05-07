@@ -948,12 +948,20 @@ unsigned int sleep (unsigned int seconds)
 char *mingw_mktemp(char *template)
 {
 	wchar_t wtemplate[MAX_PATH];
+	int offset = 0;
+
 	/* we need to return the path, thus no long paths here! */
 	if (xutftowcs_path(wtemplate, template) < 0)
 		return NULL;
+
+	if (is_dir_sep(template[0]) && !is_dir_sep(template[1]) &&
+	    iswalpha(wtemplate[0]) && wtemplate[1] == L':') {
+		/* We have an absolute path missing the drive prefix */
+		offset = 2;
+	}
 	if (!_wmktemp(wtemplate))
 		return NULL;
-	if (xwcstoutf(template, wtemplate, strlen(template) + 1) < 0)
+	if (xwcstoutf(template, wtemplate + offset, strlen(template) + 1) < 0)
 		return NULL;
 	return template;
 }
@@ -1023,8 +1031,10 @@ char *mingw_getcwd(char *pointer, int len)
 			  HANDLE, LPWSTR, DWORD, DWORD);
 	DWORD ret = GetCurrentDirectoryW(ARRAY_SIZE(cwd), cwd);
 
-	if (ret < 0 || ret >= ARRAY_SIZE(cwd))
+	if (!ret || ret >= ARRAY_SIZE(cwd)) {
+		errno = ret ? ENAMETOOLONG : err_win_to_posix(GetLastError());
 		return NULL;
+	}
 	ret = GetLongPathNameW(cwd, wpointer, ARRAY_SIZE(wpointer));
 	if (!ret && GetLastError() == ERROR_ACCESS_DENIED &&
 		INIT_PROC_ADDR(GetFinalPathNameByHandleW)) {
@@ -1164,8 +1174,10 @@ static char **get_path_split(void)
 			++n;
 		}
 	}
-	if (!n)
+	if (!n) {
+		free(envpath);
 		return NULL;
+	}
 
 	ALLOC_ARRAY(path, n + 1);
 	p = envpath;
@@ -1327,22 +1339,39 @@ static wchar_t *make_environment_block(char **deltaenv)
 	 * Items in the deltaenv list that DO NOT contain an "=" are
 	 * treated as unsetenv.
 	 *
-	 * I'm going assume that there are no duplicates in deltaenv itself.
+	 * Care needs to be taken to handle entries that are added first, and
+	 * then deleted.
 	 */
 	k_ins = 0;
 	k_del = 0;
 	for (k = 0; k < nr_delta; k++) {
 		if (strchr(deltaenv[k], '=') == NULL) {
+			wchar_t *save = w_del;
 			wptrs_del[k_del++] = w_del;
 			w_del += xutftowcs(w_del, deltaenv[k], (wend_del - w_del));
 			*w_del++ = L'='; /* append '=' to make lookup easier in next step. */
 			*w_del++ = 0;
+
+			/* If we added this key, we have to remove it again */
+			for (j = 0; j < k_ins; j++)
+				if (!wcsnicmp(wptrs_ins[j], save, w_del - save - 1)) {
+					if (j + 1 < k_ins) {
+						int delta = sizeof(wchar_t) * (wptrs_ins[j + 1] - wptrs_ins[j]), i;
+						memmove(wptrs_ins[j], wptrs_ins[j + 1], sizeof(wchar_t) * (w_ins - wptrs_ins[j + 1]));
+						for (i = j; i < --k_ins; i++)
+							wptrs_ins[i] = wptrs_ins[i + 1] - delta;
+						w_ins -= delta;
+					} else
+						w_ins = wptrs_ins[j];
+					k_ins--;
+					j--;
+				}
 		} else {
 			wptrs_ins[k_ins++] = w_ins;
 			w_ins += xutftowcs(w_ins, deltaenv[k], (wend_ins - w_ins)) + 1;
 		}
 	}
-	assert(k_ins == nr_delta_ins);
+	assert(k_ins <= nr_delta_ins);
 	assert(k_del == nr_delta_del);
 
 	/*
@@ -1353,9 +1382,11 @@ static wchar_t *make_environment_block(char **deltaenv)
 	for (j = 0; j < nr_wenv; j++) {
 		const wchar_t *v_j = my_wenviron[j];
 		wchar_t *v_j_eq = wcschr(v_j, L'=');
+		int len_j_eq, len_j;
+
 		if (!v_j_eq)
 			continue; /* should not happen */
-		int len_j_eq = v_j_eq + 1 - v_j; /* length(v_j) including '=' */
+		len_j_eq = v_j_eq + 1 - v_j; /* length(v_j) including '=' */
 
 		/* lookup v_j in list of to-delete vars */
 		for (k_del = 0; k_del < nr_delta_del; k_del++) {
@@ -1370,7 +1401,7 @@ static wchar_t *make_environment_block(char **deltaenv)
 		}
 
 		/* item is unique, add it to results. */
-		int len_j = wcslen(v_j);
+		len_j = wcslen(v_j);
 		memcpy(w_ins, v_j, len_j * sizeof(wchar_t));
 		w_ins += len_j + 1;
 
@@ -1539,12 +1570,18 @@ static pid_t mingw_spawnve_fd(const char *cmd, const char **argv, char **deltaen
 
 	if (getenv("GIT_STRACE_COMMANDS")) {
 		char **path = get_path_split();
-		cmd = path_lookup("strace.exe", path, 1);
-		if (!cmd)
+		char *p = path_lookup("strace.exe", path, 1);
+		if (!p) {
+			free_path_split(path);
 			return error("strace not found!");
-		if (xutftowcs_path(wcmd, cmd) < 0)
+		}
+		free_path_split(path);
+		if (xutftowcs_path(wcmd, p) < 0) {
+			free(p);
 			return -1;
+		}
 		strbuf_insert(&args, 0, "strace ", 7);
+		free(p);
 	}
 
 	ALLOC_ARRAY(wargs, st_add(st_mult(2, args.len), 1));
@@ -2062,7 +2099,8 @@ static void ensure_socket_initialization(void)
 			WSAGetLastError());
 
 	for (name = libraries; *name; name++) {
-		ipv6_dll = LoadLibrary(*name);
+		ipv6_dll = LoadLibraryExA(*name, NULL,
+					  LOAD_LIBRARY_SEARCH_SYSTEM32);
 		if (!ipv6_dll)
 			continue;
 
@@ -2910,6 +2948,9 @@ static void setup_windows_environment(void)
 	 */
 	if (!(tmp = getenv("MSYS")) || !strstr(tmp, "winsymlinks:nativestrict"))
 		has_symlinks = 0;
+
+	if (!getenv("LC_ALL") && !getenv("LC_CTYPE") && !getenv("LANG"))
+		setenv("LC_CTYPE", "C", 1);
 }
 
 int handle_long_path(wchar_t *path, int len, int max_path, int expand)
@@ -3009,6 +3050,62 @@ static char *wcstoutfdup_startup(char *buffer, const wchar_t *wcs, size_t len)
 	return memcpy(malloc_startup(len), buffer, len);
 }
 
+static void maybe_redirect_std_handle(const wchar_t *key, DWORD std_id, int fd,
+				      DWORD desired_access, DWORD flags)
+{
+	DWORD create_flag = fd ? OPEN_ALWAYS : OPEN_EXISTING;
+	wchar_t buf[MAX_LONG_PATH];
+	DWORD max = ARRAY_SIZE(buf);
+	HANDLE handle;
+	DWORD ret = GetEnvironmentVariableW(key, buf, max);
+
+	if (!ret || ret >= max)
+		return;
+
+	/* make sure this does not leak into child processes */
+	SetEnvironmentVariableW(key, NULL);
+	if (!wcscmp(buf, L"off")) {
+		close(fd);
+		handle = GetStdHandle(std_id);
+		if (handle != INVALID_HANDLE_VALUE)
+			CloseHandle(handle);
+		return;
+	}
+	if (std_id == STD_ERROR_HANDLE && !wcscmp(buf, L"2>&1")) {
+		handle = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (handle == INVALID_HANDLE_VALUE) {
+			close(fd);
+			handle = GetStdHandle(std_id);
+			if (handle != INVALID_HANDLE_VALUE)
+				CloseHandle(handle);
+		} else {
+			int new_fd = _open_osfhandle((intptr_t)handle, O_BINARY);
+			SetStdHandle(std_id, handle);
+			dup2(new_fd, fd);
+			/* do *not* close the new_fd: that would close stdout */
+		}
+		return;
+	}
+	handle = CreateFileW(buf, desired_access, 0, NULL, create_flag,
+			     flags, NULL);
+	if (handle != INVALID_HANDLE_VALUE) {
+		int new_fd = _open_osfhandle((intptr_t)handle, O_BINARY);
+		SetStdHandle(std_id, handle);
+		dup2(new_fd, fd);
+		close(new_fd);
+	}
+}
+
+static void maybe_redirect_std_handles(void)
+{
+	maybe_redirect_std_handle(L"GIT_REDIRECT_STDIN", STD_INPUT_HANDLE, 0,
+				  GENERIC_READ, FILE_ATTRIBUTE_NORMAL);
+	maybe_redirect_std_handle(L"GIT_REDIRECT_STDOUT", STD_OUTPUT_HANDLE, 1,
+				  GENERIC_WRITE, FILE_ATTRIBUTE_NORMAL);
+	maybe_redirect_std_handle(L"GIT_REDIRECT_STDERR", STD_ERROR_HANDLE, 2,
+				  GENERIC_WRITE, FILE_FLAG_NO_BUFFERING);
+}
+
 #if defined(_MSC_VER)
 
 #ifdef _DEBUG
@@ -3037,7 +3134,7 @@ int msc_startup(int argc, wchar_t **w_argv, wchar_t **w_env)
 	char **my_utf8_argv = NULL, **save = NULL;
 	char *buffer = NULL;
 	int maxlen;
-	int k, x;
+	int k, exit_status;
 
 #ifdef _DEBUG
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_DEBUG);
@@ -3046,6 +3143,8 @@ int msc_startup(int argc, wchar_t **w_argv, wchar_t **w_env)
 #ifdef USE_MSVC_CRTDBG
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
+
+	maybe_redirect_std_handles();
 
 	/* determine size of argv conversion buffer */
 	maxlen = wcslen(_wpgmptr);
@@ -3092,7 +3191,7 @@ int msc_startup(int argc, wchar_t **w_argv, wchar_t **w_env)
 	current_directory_len = GetCurrentDirectoryW(0, NULL);
 
 	/* invoke the real main() using our utf8 version of argv. */
-	int exit_status = msc_main(argc, my_utf8_argv);
+	exit_status = msc_main(argc, my_utf8_argv);
 
 	for (k = 0; k < argc; k++)
 		free(save[k]);
@@ -3110,6 +3209,8 @@ void mingw_startup(void)
 	char *buffer;
 	wchar_t **wenv, **wargv;
 	_startupinfo si;
+
+	maybe_redirect_std_handles();
 
 	/* get wide char arguments and environment */
 	si.newmode = 0;

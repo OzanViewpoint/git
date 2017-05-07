@@ -558,9 +558,34 @@ test_expect_success 'do not dereference NULL upon %(HEAD) on unborn branch' '
 	test_when_finished "git checkout master" &&
 	git for-each-ref --format="%(HEAD) %(refname:short)" refs/heads/ >actual &&
 	sed -e "s/^\* /  /" actual >expect &&
-	git checkout --orphan HEAD &&
+	git checkout --orphan orphaned-branch &&
 	git for-each-ref --format="%(HEAD) %(refname:short)" refs/heads/ >actual &&
 	test_cmp expect actual
+'
+
+cat >trailers <<EOF
+Reviewed-by: A U Thor <author@example.com>
+Signed-off-by: A U Thor <author@example.com>
+EOF
+
+test_expect_success 'basic atom: head contents:trailers' '
+	echo "Some contents" > two &&
+	git add two &&
+	git commit -F - <<-EOF &&
+	trailers: this commit message has trailers
+
+	Some message contents
+
+	$(cat trailers)
+	EOF
+	git for-each-ref --format="%(contents:trailers)" refs/heads/master >actual &&
+	sanitize_pgp <actual >actual.clean &&
+	# git for-each-ref ends with a blank line
+	cat >expect <<-EOF &&
+	$(cat trailers)
+
+	EOF
+	test_cmp expect actual.clean
 '
 
 test_done

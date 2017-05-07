@@ -190,17 +190,20 @@ static int delete_branches(int argc, const char **argv, int force, int kinds,
 	int ret = 0;
 	int remote_branch = 0;
 	struct strbuf bname = STRBUF_INIT;
+	unsigned allowed_interpret;
 
 	switch (kinds) {
 	case FILTER_REFS_REMOTES:
 		fmt = "refs/remotes/%s";
 		/* For subsequent UI messages */
 		remote_branch = 1;
+		allowed_interpret = INTERPRET_BRANCH_REMOTE;
 
 		force = 1;
 		break;
 	case FILTER_REFS_BRANCHES:
 		fmt = "refs/heads/%s";
+		allowed_interpret = INTERPRET_BRANCH_LOCAL;
 		break;
 	default:
 		die(_("cannot use -a with -d"));
@@ -215,7 +218,7 @@ static int delete_branches(int argc, const char **argv, int force, int kinds,
 		char *target = NULL;
 		int flags = 0;
 
-		strbuf_branchname(&bname, argv[i]);
+		strbuf_branchname(&bname, argv[i], allowed_interpret);
 		free(name);
 		name = mkpathdup(fmt, bname.buf);
 
@@ -512,15 +515,6 @@ static void print_ref_list(struct ref_filter *filter, struct ref_sorting *sortin
 	if (filter->verbose)
 		maxwidth = calc_maxwidth(&array, strlen(remote_prefix));
 
-	/*
-	 * If no sorting parameter is given then we default to sorting
-	 * by 'refname'. This would give us an alphabetically sorted
-	 * array with the 'HEAD' ref at the beginning followed by
-	 * local branches 'refs/heads/...' and finally remote-tacking
-	 * branches 'refs/remotes/...'.
-	 */
-	if (!sorting)
-		sorting = ref_default_sorting();
 	ref_array_sort(sorting, &array);
 
 	for (i = 0; i < array.nr; i++)
@@ -531,7 +525,7 @@ static void print_ref_list(struct ref_filter *filter, struct ref_sorting *sortin
 
 static void reject_rebase_or_bisect_branch(const char *target)
 {
-	struct worktree **worktrees = get_worktrees();
+	struct worktree **worktrees = get_worktrees(0);
 	int i;
 
 	for (i = 0; worktrees[i]; i++) {
@@ -645,6 +639,7 @@ int cmd_branch(int argc, const char **argv, const char *prefix)
 	const char *new_upstream = NULL;
 	enum branch_track track;
 	struct ref_filter filter;
+	int icase = 0;
 	static struct ref_sorting *sorting = NULL, **sorting_tail = &sorting;
 
 	struct option options[] = {
@@ -686,6 +681,7 @@ int cmd_branch(int argc, const char **argv, const char *prefix)
 			OPTION_CALLBACK, 0, "points-at", &filter.points_at, N_("object"),
 			N_("print only branches of the object"), 0, parse_opt_object_name
 		},
+		OPT_BOOL('i', "ignore-case", &icase, N_("sorting and filtering are case insensitive")),
 		OPT_END(),
 	};
 
@@ -723,6 +719,8 @@ int cmd_branch(int argc, const char **argv, const char *prefix)
 
 	if (filter.abbrev == -1)
 		filter.abbrev = DEFAULT_ABBREV;
+	filter.ignore_case = icase;
+
 	finalize_colopts(&colopts, -1);
 	if (filter.verbose) {
 		if (explicitly_enable_column(colopts))
@@ -744,6 +742,16 @@ int cmd_branch(int argc, const char **argv, const char *prefix)
 		if ((filter.kind & FILTER_REFS_BRANCHES) && filter.detached)
 			filter.kind |= FILTER_REFS_DETACHED_HEAD;
 		filter.name_patterns = argv;
+		/*
+		 * If no sorting parameter is given then we default to sorting
+		 * by 'refname'. This would give us an alphabetically sorted
+		 * array with the 'HEAD' ref at the beginning followed by
+		 * local branches 'refs/heads/...' and finally remote-tacking
+		 * branches 'refs/remotes/...'.
+		 */
+		if (!sorting)
+			sorting = ref_default_sorting();
+		sorting->ignore_case = icase;
 		print_ref_list(&filter, sorting);
 		print_columns(&output, colopts, NULL);
 		string_list_clear(&output, 0);
